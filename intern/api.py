@@ -1,48 +1,68 @@
+# api.py
 from fastapi import FastAPI, Query
-from pymongo import MongoClient
-from typing import List
+from typing import List, Optional
 from datetime import datetime
+import pandas as pd
+from sqlalchemy import create_engine, text
+from pymongo import MongoClient
 
 app = FastAPI()
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['sse_stocks']
-collection = db['daily_data']
+# Connections
+#pg_engine = create_engine("postgresql://postgres:password@localhost:5432/market_data")
+pg_engine = create_engine("postgresql://postgres:mysecretpassword@localhost:5433/market_data")
+mongo_client = MongoClient("mongodb://localhost:27017")
+mongo_coll = mongo_client["market_data"]["bars_1min"]
 
 @app.get("/data")
-def get_data(
-    ticker: str = Query(..., description="Stock ticker, e.g., 600000"),
-    start_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
-    end_date: str = Query(..., description="End date (YYYY-MM-DD)"),
-    fields: List[str] = Query(..., description="Comma-separated fields, e.g., high,low,volume")
+def get_intraday_data(
+    start_time: str,
+    end_time: str,
+    tickers: List[str] = Query(...),
+    fields: List[str] = Query(["open","high","low","close","volume"]),
+    source: str = Query("timescaledb", description="timescaledb or mongodb")
 ):
-    # Validate dates
-    try:
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    except ValueError:
-        return {"error": "Invalid date format. Use YYYY-MM-DD."}
+    start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+    end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
 
-    if start_dt > end_dt:
-        return {"error": "Start date must be before end date."}
+    #allowed_fields = {"open","high","low","close","volume","vwap","trades","timestamp","ticker"}
+    allowed_fields = {"open", "high", "low", "close", "volume", "timestamp", "ticker"}
 
-    # Query MongoDB
-    query = {
-        "ticker": ticker,
-        "date": {"$gte": start_date, "$lte": end_date}
-    }
-    # Build projection
-    projection = {"_id": 0, "date": 1, "ticker": 1}  # Always include date and ticker
-    for field in fields:
-        if field in ["open", "high", "low", "close", "volume"]:
-            projection[field] = 1
-        else:
-            return {"error": f"Invalid field: {field}. Allowed: open,high,low,close,volume"}
+    if source == "timescaledb":
+        # Generate IN clause placeholders (e.g., :ticker1, :ticker2, ...)
+        in_placeholders = ', '.join(f':ticker{i + 1}' for i in range(len(tickers)))
 
-    data = list(collection.find(query, projection).sort("date", 1))
+        # query = f"""
+        #     SELECT timestamp, ticker, {', '.join([f for f in fields if f in allowed_fields])}
+        #     FROM bars_1min
+        #     WHERE ticker = ANY(:tickers)
+        #     AND timestamp BETWEEN :start AND :end
+        #     ORDER BY ticker, timestamp
+        # """
+        query = f"""
+                SELECT timestamp, ticker, {', '.join([f for f in fields if f in allowed_fields])}
+                FROM bars_1min 
+                WHERE ticker IN ({in_placeholders})
+                AND timestamp BETWEEN :start AND :end
+                ORDER BY ticker, timestamp
+            """
 
-    if not data:
-        return {"message": "No data found for the given parameters."}
+        #df = pd.read_sql(query, pg_engine, params={"tickers": tickers, "start": start_dt, "end": end_dt})
+        # Create params dict with individual ticker bindings
+        params = {f'ticker{i + 1}': ticker for i, ticker in enumerate(tickers)}
+        params.update({"start": start_dt, "end": end_dt})
+        df = pd.read_sql(text(query), pg_engine, params=params)
+        return df.to_dict(orient="records")
 
-    return data
+    elif source == "mongodb":
+        projection = {f: 1 for f in fields}
+        projection["_id"] = 0
+        projection["timestamp"] = 1
+        projection["ticker"] = 1
+
+        cursor = mongo_coll.find(
+            {"ticker": {"$in": tickers}, "timestamp": {"$gte": start_dt, "$lte": end_dt}},
+            projection
+        ).sort([("ticker", 1), ("timestamp", 1)])
+
+        return list(cursor)
